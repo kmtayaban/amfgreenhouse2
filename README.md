@@ -5,7 +5,10 @@ This project examined the effect of fertilization and tillage practices, and arb
 - includes all data to reproduce analyses
 ## figures
 - final figures formatted for the manuscript
+- codes to create figures
 ## main
 - code to reproduce analyses
 ## outputs
-.csv files exported during code execution
+- files exported during code execution
+## supplementary
+- files attached to manuscript
