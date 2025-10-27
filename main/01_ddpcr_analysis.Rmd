@@ -1,0 +1,609 @@
+---
+title: "ddPCR Data Analysis Using a Hurdle Model"
+author: "Kuselah Tayaban"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This document presents a hurdle model analysis of droplet digital PCR (ddPCR) data to account for zero-inflation and continuous positive responses. The hurdle model allows us to separately analyze:
+
+-   The probability of detection (binary part) — whether a target gene is detected or not.
+
+-   The conditional abundance (continuous part) — the amount detected when present.
+
+```{r pressure, echo=FALSE}
+# Load required packages
+library(tidyverse)
+library(glmmTMB)
+library(DHARMa)
+library(performance)
+library(emmeans)
+library(MuMIn)
+library(cv)
+library(ggplot2)
+```
+
+## Data import and preparation
+
+```{r}
+# Import data
+data_frame<-read.csv(file = "Expt02_ddpcr_dtr.csv",header = TRUE,sep = ',')
+data_frame$AMFIsolate<-as.factor(data_frame$AMFIsolate)
+data_frame$ColonizationRegion<-as.factor(data_frame$ColonizationRegion)
+data_frame$HarvestTime<-as.numeric(data_frame$HarvestTime)
+data_frame$Treatment<-as.factor(data_frame$Treatment)
+```
+
+## Data exploration
+
+```{r}
+# Summary of dataset
+summary(data_frame)
+# Histogram
+hist(data_frame$ConcentrationPeruL) #zero-inflated, outlier at 1200
+# Remove outlier
+new_df<-data_frame[-c(30), ]
+# Check residual fit of a normally distributed linear model
+normal_lm<-lmer(ConcentrationPeruL~AMFIsolate+Treatment +  
+                     ColonizationRegion + HarvestTime+(1|Block),
+                   data = new_df)
+# DHARMA residual goodness of fit tests
+normal_res<-simulateResiduals(normal_lm)
+plot(normal_res) #significant deviation from expectation
+# Compare to pearson residuals
+fitted_values<-fitted(normal_lm)
+residuals<-residuals(normal_lm, type = "response")
+plot(fitted_values, residuals) # non normal distribution
+# Verify zero-inflation
+# Add binomial characterization of concentration: 0 = no hit, 1 = hit
+data <- new_df %>%
+  mutate(Presence = if_else(ConcentrationPeruL > 0, 1, 0))
+# Check conversion
+table(data$Presence) 
+data$Presence<-as.numeric(data$Presence)
+proportion_zeros<-sum(data$Presence == 0) / nrow(data)
+print(proportion_zeros) # proportion of zeros is 29.79%
+```
+
+Outliers were retained from the dataset since range between 300 and 600 gene copies/ul are usually within biological range. Data looks like zero-inflated hence the non-normal distribution observed. To verify zero inflation, the response variable was treated as binary. ConcentrationPeruL variable was converted to presence/absence or 0/1 data  with 0 = no isolate detected, 1 = isolate detected. The proportion of zeros within the data was also evaluated.
+
+## Handle zero-inflation through hurdle model
+
+A hurdle model separates the data-generating process into two components: (i) a binary component that models the probability of observing zero versus any positive count, and (ii) a truncated count component that models the distribution of positive values. This framework is appropriate for our data because zeros may arise from samples in which AMF gene copies were not detected, while positive counts reflect variation in abundance once detection occurred. The hurdle specification therefore allows to distinguish between factors influencing the likelihood of detection and those affecting abundance given detection, providing a more realistic representation of the biological and technical processes underlying ddPCR results.
+
+### Part 1: Binary data analysis
+
+Create binary data, wherein 0 means AMF is absent and 1 means AMF is present.
+
+```{r}
+# Create a second data frame for binary data 
+SUBSET<-data%>%
+  filter(ConcentrationPeruL>0)
+summary(SUBSET)
+# Convert SUBSET data to appropriate forms
+SUBSET$AMFIsolate<-as.factor(SUBSET$AMFIsolate)
+SUBSET$ColonizationRegion<-as.factor(SUBSET$ColonizationRegion)
+SUBSET$HarvestTime<-as.integer(SUBSET$HarvestTime)
+SUBSET$Treatment<-as.factor(SUBSET$Treatment)
+SUBSET$ConcentrationPeruL<-as.numeric(SUBSET$ConcentrationPeruL)
+# export data to .csv file for later use
+write.csv2(SUBSET, file = 'Expt02_ddpcr_binary.csv')
+```
+
+Visualize responses of binary data to each factor
+
+```{r}
+# Create frequency table with factor AMF Isolate
+counts_amf <- data.frame(ftable(data$Presence~data$AMFIsolate))
+barplot(Freq ~ data.Presence + data.AMFIsolate,
+        data = counts_amf,
+        col = c("#046C9A","orange"),
+        beside = TRUE,
+        xlab = "AMF Isolate",
+        ylab = "Fequency",
+        ylim=c(0,100))
+legend("topleft", fill = c("orange", "#046C9A"), 
+       legend = c("Present", "Absent"), horiz = T) # possible effect of AMF isolate
+# Create frequency table with factor Colonization Region
+counts_amf <- data.frame(ftable(data$Presence~data$ColonizationRegion))
+barplot(Freq ~ data.Presence + data.ColonizationRegion,
+        data = counts_amf,
+        col = c("#046C9A","orange"),
+        beside = TRUE,
+        xlab = "Colonization Region",
+        ylab = "Fequency",
+        ylim=c(0,100))
+legend("topleft", fill = c("orange", "#046C9A"), 
+       legend = c("Present", "Absent"), horiz = T) # possible effect of colonization region
+# create frequency table with factor Harvest time
+counts_amf <- data.frame(ftable(data$Presence~data$HarvestTime))
+barplot(Freq ~ data.Presence + data.HarvestTime,
+        data = counts_amf,
+        col = c("#046C9A","orange"),
+        beside = TRUE,
+        xlab = "Harvest Time",
+        ylab = "Fequency",
+        ylim=c(0,100))
+legend("topleft", fill = c("orange", "#046C9A"), 
+       legend = c("Present", "Absent"), horiz = T) # no clear pattern on harvest time
+# create frequency table with factor Treatment
+counts_amf <- data.frame(ftable(data$Presence~data$Treatment))
+barplot(Freq ~ data.Presence + data.Treatment,
+        data = counts_amf,
+        col = c("#046C9A","orange"),
+        beside = TRUE,
+        xlab = "Treatment",
+        ylab = "Fequency",
+        ylim=c(0,100))
+legend("topleft", fill = c("orange", "#046C9A"), 
+       legend = c("Present", "Absent"), horiz = T) # possible effect of treatment
+```
+
+Visualize possible interactions of factors with interaction plots
+
+```{r}
+# AMF isolate x colonization region
+interaction.plot(data$AMFIsolate, data$ColonizationRegion, data$Presence,
+                 xlab= "AMF Isolate",
+                 ylab= "Mean presence",
+                 legend= TRUE,
+                 col= 1:length(unique(data$ColonizationRegion)),
+                 pch= 1:length(unique(data$ColonizationRegion)),
+                 type= "b") # no interaction except for DAOM197198 but only slightly (?)
+# AMF isolate x harvest time
+interaction.plot(data$AMFIsolate, data$HarvestTime, 
+                 data$Presence,
+                 xlab= "AMF Isolate",
+                 ylab= "Mean presence",
+                 legend= TRUE,
+                 col= 1:length(unique(data$HarvestTime)),
+                 pch= 1:length(unique(data$HarvestTime)),
+                 type= "b") # possible interaction
+# AMF isolate x treatment
+interaction.plot(data$AMFIsolate, data$Treatment, 
+                 data$Presence,
+                 xlab= "AMF Isolate",
+                 ylab= "Mean presence",
+                 legend= TRUE,
+                 col= 1:length(unique(data$Treatment)),
+                 pch= 1:length(unique(data$Treatment)),
+                 type= "b") # possible interaction
+# colonization region x harvest time
+interaction.plot(data$ColonizationRegion, data$HarvestTime, 
+                 data$Presence,
+                 xlab= "Colonization Region",
+                 ylab= "Mean presence",
+                 legend= TRUE,
+                 col= 1:length(unique(data$HarvestTime)),
+                 pch= 1:length(unique(data$HarvestTime)),
+                 type= "b") # possible slight interaction
+# colonization region x treatment
+interaction.plot(data$ColonizationRegion, data$Treatment, 
+                 data$Presence,
+                 xlab= "Colonization Region",
+                 ylab= "Mean presence",
+                 legend= TRUE,
+                 col= 1:length(unique(data$Treatment)),
+                 pch= 1:length(unique(data$Treatment)),
+                 type= "b") # possible interaction
+# treatment x harvest time
+interaction.plot(data$HarvestTime, data$Treatment, 
+                 data$Presence,
+                 xlab= "Treatment",
+                 ylab= "Mean presence",
+                 legend= TRUE,
+                 col= 1:length(unique(data$Treatment)),
+                 pch= 1:length(unique(data$Treatment)),
+                 type= "b") # possible interaction
+```
+
+Model construction and fitting
+
+```{r}
+# Build a global fixed effects model with all factors and interactions, with "Block" as random effect 
+mod2<-glmer(Presence ~ AMFIsolate + Treatment +  
+               ColonizationRegion + HarvestTime + 
+               AMFIsolate*Treatment + AMFIsolate*ColonizationRegion +
+               AMFIsolate*HarvestTime + 
+               Treatment*ColonizationRegion + 
+               Treatment*HarvestTime + 
+               ColonizationRegion*HarvestTime + 
+               (1|Block), family=binomial(link="logit"), data=data)
+# automated model selection using dredge
+dd <- dredge(mod1)
+summary(dd)
+# build final model based on lowest AICc values
+finalmod<-glmer(Presence~AMFIsolate + ColonizationRegion + HarvestTime +
+              Treatment + (1|Block), 
+            family=binomial(link="logit"), data=data)
+summary(finalmod)
+#check for collinearity of terms
+vif(finalmod)
+```
+
+Final model was selected with lowest AICc values. Collinearity was checked among all the terms in the model. GVIF\^(1/(2\*Df)) values \< 2 indicate no collinearity and values \> 2 indicate moderate collinearity. No collinearity were detected among the terms in the final model. Non significant terms were dropped from the final model.
+
+Model diagnostics and cross-validation
+
+```{r}
+# Simulate residuals and check model fit using the DHARMa package
+DHARMA_res_binom <- simulateResiduals(finalmod)
+plot(DHARMA_res_binom) # looks good, residuals uniformly distributed
+# Check for model overfitting by looking at actual vs. expected dispersion
+testDispersion(DHARMA_res_binom) # p-value is not significant, indicates model predictions fall within the expected range
+# cross validation of final model
+cv<-cv(finalmod)
+summary(cv)
+```
+
+The DHARMa package was used to evaluate residual diagnostics by comparing the fitted model to expected range of the applied distribution. A flat, uniform QQ-plot suggests good model fit. Non-significant results (p \> 0.05) from the tests indicate no major issues with dispersion or zero-inflation. Low MSE from cross-validation means model predicts the outcome values accurately and generalizes well.
+
+Post-hoc tests for significant terms in the model
+
+```{r}
+# AMF isolate
+emmeans.amf<-emmeans(finalmod,~AMFIsolate)
+pairs(emmeans.amf,adjust="fdr")
+# treatment
+emmeans.inoc<-emmeans(finalmod,~Treatment)
+pairs(emmeans.inoc,adjust="fdr") 
+# colonization region
+emmeans.cr<-emmeans(finalmod,~ColonizationRegion)
+pairs(emmeans.cr,adjust="fdr") 
+```
+
+Visualization
+
+```{r}
+# import data
+data_frame<-read.csv(file = "Expt02_ddpcr_binary.csv",header = TRUE,sep = ',')
+data_frame$AMFIsolate<-as.factor(data_frame$AMFIsolate)
+data_frame$ColonizationRegion<-as.factor(data_frame$ColonizationRegion)
+data_frame$HarvestTime<-as.factor(data_frame$HarvestTime)
+data_frame$Treatment<-as.factor(data_frame$Treatment)
+data_frame$Presence<-as.factor(data_frame$Presence)
+# drop controls
+levels(data_frame$AMFIsolate)
+data<-droplevels(subset(data_frame,AMFIsolate !="Control"))
+# get percent values
+plotdata <- data %>%
+  group_by(Treatment, AMFIsolate, ColonizationRegion, HarvestTime,
+           Presence) %>%
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n),
+         lbl = scales::percent(pct))
+# re-arrange legend and remove legend title
+plotdata$InoculationTiming<-factor(plotdata$InoculationTiming,
+                                  levels = c("highfert-notill",
+                                      "highfert-till",
+                                      "nofert-notill",
+                                      "nofert-till"))
+plotdata$AMFIsolate<-factor(plotdata$AMFIsolate,
+                        levels = c("DAOM197198",
+                                   "CC4",
+                                   "Cuba8"))
+# plot
+ht.labs<-c("2 months","4 months")
+names(ht.labs)<-c("2","4")
+p1<-ggplot(plotdata,aes(x=Treatment,y=pct,fill = Presence))+
+  geom_bar(stat = "identity",position = "fill",color="white",aes(alpha = 0.8))+
+  facet_grid(AMFIsolate~ColonizationRegion+HarvestTime,
+             labeller=labeller(HarvestTime = ht.labs))+
+  theme_bw(base_size = 20)+theme(panel.grid = element_blank(),
+                              strip.background = element_blank())+
+                              scale_fill_manual(values = c("#004488","#BB5566"))
+# rename and modify axis labels
+p1<-p1+labs(y="AMF detection rate, %")+
+  theme(axis.text.x = element_text(angle = -45,hjust = 0,vjust = 0.5))
+p1
+
+# graph 2 month harvest time only
+# drop 4 month haevest time
+levels(plotdata$HarvestTime)
+data<-droplevels(subset(plotdata,HarvestTime !="4"))
+# re-arrange legend and remove legend title
+data$Treatment<-factor(data$Treatment,
+                                   levels = c("highfert-notill",
+                                      "highfert-till",
+                                      "nofert-notill",
+                                      "nofert-till"))
+data$AMFIsolate<-factor(data$AMFIsolate,
+                            levels = c("DAOM197198",
+                                       "CC4",
+                                       "Cuba8"))
+# plot
+ht.labs<-c("2 months","4 months")
+names(ht.labs)<-c("2","4")
+p2<-ggplot(data,aes(x=Treatment,y=pct,fill = Presence))+
+  geom_bar(stat = "identity",position = "fill",color="white",aes(alpha = 0.8))+
+  facet_grid(AMFIsolate~ColonizationRegion+HarvestTime,
+             labeller=labeller(HarvestTime = ht.labs))+
+  theme_bw(base_size = 20)+theme(panel.grid = element_blank(),
+                              strip.background = element_blank())+
+                              scale_fill_manual(values = c("#004488","#BB5566"))
+# rename and modify axis labels
+p2<-p2labs(y="AMF detection rate, %")+theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 0.5))
+p2
+# save
+ggsave(p2,filename = "FigureA3_ddpcr_binary_ht2.png", dpi = 300, width = 8, 
+       height = 8, units = "in")
+
+# graph 4 month harvest time only
+# drop controls
+levels(plotdata$HarvestTime)
+data<-droplevels(subset(plotdata,HarvestTime !="2"))
+# re-arrange legend and remove legend title
+data$Treatment<-factor(data$Treatment,
+                               levels = c("no inoculation",
+                                          "pre-inoculation",
+                                          "co-inoculation",
+                                          "combination"))
+data$AMFIsolate<-factor(data$AMFIsolate,
+                        levels = c("DAOM197198",
+                                   "CC4",
+                                   "Cuba8"))
+#plot
+ht.labs<-c("2 months","4 months")
+names(ht.labs)<-c("2","4")
+p3<-ggplot(data,aes(x=Treatment,y=pct,fill = Presence))+
+  geom_bar(stat = "identity",position = "fill",color="white",aes(alpha = 0.8))+
+  facet_grid(AMFIsolate~ColonizationRegion+HarvestTime,
+             labeller=labeller(HarvestTime = ht.labs))+
+  theme_bw(base_size = 20)+theme(panel.grid = element_blank(),
+                              strip.background = element_blank())+
+                              scale_fill_manual(values = c("#004488","#BB5566"))
+# rename and modify axis labels
+p3<-p3+labs(y="AMF detection rate, %")+theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 0.5))
+p3
+# save
+ggsave(p3,filename = "Figure2.1_ddpcr_binary_ht4.png", dpi = 300, width = 8, 
+       height = 8, units = "in")
+```
+
+### Part 2: Count data analysis
+
+Subset data to not include zeros
+
+```{r}
+# Subset data to not include zero
+data_pos<-subset(data, ConcentrationPeruL > 0)
+# Histogram
+hist(data_pos$ConcentrationPeruL) # Positively skewed tail and positive continuous values suggest gamma distribution
+# Check data dispersion by comparing variance to the mean (variance>1 suggests 
+#overdispersion)
+var_to_mean <- var(data_pos$ConcentrationPeruL) / mean(data_pos$ConcentrationPeruL)
+print(var_to_mean)
+# overdispersed data
+```
+
+Visualize responses of count data to each factor
+
+```{r}
+# Harvest time
+plot(ConcentrationPeruL~as.factor(HarvestTime),data = data_pos,
+     xlab = "Harvest Time",ylab = "Concentration per uL") # likely no effect of harvest time
+# colonization region
+plot(ConcentrationPeruL~as.factor(ColonizationRegion),data = data_pos,
+     xlab = "Colonization Region",ylab = "Concentration per uL") # possible effect
+# Treatment
+plot(ConcentrationPeruL~as.factor(Treatment),data = data_pos,
+     xlab = "Inoculation Treatment",ylab = "Concentration per uL") # possible effect of treatment
+# AMF isolate
+plot(ConcentrationPeruL~as.factor(AMFIsolate),data = data_pos,
+     xlab = "AMF Isolate",ylab = "Concentration per uL") # strong effect of AMF isolate
+```
+
+Visualize possible interactions of factors with interaction plots
+
+```{r}
+# Treatment x AMF isolate
+interaction.plot(data_pos$Treatment, data_pos$AMFIsolate, 
+                 data_pos$ConcentrationPeruL,
+                 xlab= "Treatment",
+                 ylab= "Concentration per uL",
+                 legend= TRUE,
+                 col= 1:length(unique(data_pos$AMFIsolate)),
+                 pch= 1:length(unique(data_pos$AMFIsolate)),
+                 type= "b") # possible interaction
+# Treatment x Harvest time
+interaction.plot(data_pos$Treatment, data_pos$HarvestTime, 
+                 data_pos$ConcentrationPeruL,
+                 xlab= "Treatment",
+                 ylab= "Concentration per uL",
+                 legend= TRUE,
+                 col= 1:length(unique(data_pos$HarvestTime)),
+                 pch= 1:length(unique(data_pos$HarvestTime)),
+                 type= "b") # no interaction
+# Treatment x Colonization region
+interaction.plot(data_pos$Treatment, data_pos$ColonizationRegion, 
+                 data_pos$ConcentrationPeruL,
+                 xlab= "Treatment",
+                 ylab= "Concentration per uL",
+                 legend= TRUE,
+                 col= 1:length(unique(data_pos$ColonizationRegion)),
+                 pch= 1:length(unique(data_pos$ColonizationRegion)),
+                 type= "b") # no interaction
+# AMF isolate x harvest time
+interaction.plot(data_pos$AMFIsolate, data_pos$HarvestTime, 
+                 data_pos$ConcentrationPeruL,
+                 xlab= "AMF Isolate",
+                 ylab= "Concentration per uL",
+                 legend= TRUE,
+                 col= 1:length(unique(data_pos$HarvestTime)),
+                 pch= 1:length(unique(data_pos$HarvestTime)),
+                 type= "b") # possible interaction
+# AMF isolate x colonization region
+interaction.plot(data_pos$AMFIsolate, data_pos$ColonizationRegion, 
+                 data_pos$ConcentrationPeruL,
+                 xlab= "AMF Isolate",
+                 ylab= "Concentration per uL",
+                 legend= TRUE,
+                 col= 1:length(unique(data_pos$ColonizationRegion)),
+                 pch= 1:length(unique(data_pos$ColonizationRegion)),
+                 type= "b") # possible interaction
+# Harvest time x colonization region
+interaction.plot(data_pos$HarvestTime, data_pos$ColonizationRegion, 
+                 data_pos$ConcentrationPeruL,
+                 xlab= "AMF Isolate",
+                 ylab= "Concentration per uL",
+                 legend= TRUE,
+                 col= 1:length(unique(data_pos$ColonizationRegion)),
+                 pch= 1:length(unique(data_pos$ColonizationRegion)),
+                 type= "b") # no interaction
+```
+
+Model construction and fitting
+
+```{r}
+# Build a global fixed effects model with all factors and interactions, with "Block" as random effect 
+mod1<-glmer(ConcentrationPeruL ~ AMFIsolate + Treatment +  
+              ColonizationRegion + HarvestTime + 
+              AMFIsolate*Treatment + AMFIsolate*ColonizationRegion +
+              AMFIsolate*HarvestTime + 
+              Treatment*ColonizationRegion + 
+              Treatment*HarvestTime + 
+              ColonizationRegion*HarvestTime + 
+              AMFIsolate*Treatment*ColonizationRegion +
+              (1|Block), family=Gamma(link="log"), data=data_pos)
+# automated model selection using dredge
+dd <- dredge(mod1)
+summary(dd)
+# build final model based on lowest AICc values
+finalmod<-glmer(ConcentrationPeruL ~ AMFIsolate + Treatment +  
+                  ColonizationRegion + HarvestTime + 
+                  AMFIsolate*Treatment + AMFIsolate*ColonizationRegion +
+                  AMFIsolate*HarvestTime + 
+                  Treatment*ColonizationRegion + 
+                  Treatment*HarvestTime + 
+                  AMFIsolate*Treatment*ColonizationRegion +
+                  (1|Block), family=Gamma(link="log"), data=data_pos)
+summary(finalmod)
+#check for collinearity of terms
+vif(finalmod)
+```
+
+Final model was selected with lowest AICc values. Collinearity was checked among all the terms in the model. GVIF\^(1/(2\*Df)) values \< 2 indicate no collinearity and values \> 2 indicate moderate collinearity. No collinearity were detected among the terms in the final model.
+
+Model diagnostics and cross-validation
+
+```{r}
+# Simulate residuals and check model fit using the DHARMa package
+DHARMA_res_binom <- simulateResiduals(finalmod) plot(DHARMA_res_binom) # looks good, residuals uniformly distributed 
+# Check for model overfitting by looking at actual vs. expected dispersion
+testDispersion(DHARMA_res_binom) # p-value is not significant, indicates model predictions fall within the expected range 
+# cross validation of final model 
+cv<-cv(finalmod) 
+summary(cv)
+```
+
+The DHARMa package was used to evaluate residual diagnostics by comparing the fitted model to expected range of the applied distribution. A flat, uniform QQ-plot suggests good model fit. Non-significant results (p \> 0.05) from the tests indicate no major issues with dispersion or zero-inflation. Low MSE from cross-validation means model predicts the outcome values accurately and generalizes well.
+
+Post-hoc tests for significant terms in the model
+
+```{r}
+# AMF isolate
+emmeans.amf<-emmeans(finalmod,~AMFIsolate)
+pairs(emmeans.amf,adjust="fdr") 
+# Colonization Region
+emmeans.cr<-emmeans(finalmod,~ColonizationRegion)
+pairs(emmeans.cr,adjust="fdr") 
+```
+
+Visualization
+
+```{r}
+# load data
+data<-read.csv("Expt02_ddpcr_dtr.csv")
+# set factors
+data$Treatment<-as.factor(data$Treatment)
+data$AMFIsolate<-as.factor(data$AMFIsolate)
+data$HarvestTime<-as.factor(data$HarvestTime)
+# drop controls
+levels(data$AMFIsolate)
+data<-droplevels(subset(data,AMFIsolate !="Control"))
+# re-arrange legend and remove legend title
+data$Treatment<-factor(data$Treatment,
+                                  levels = c("highfert-till",
+                                             "highfert-notill",
+                                             "nofert-till",
+                                             "nofert-notill"))
+data$AMFIsolate<-factor(data$AMFIsolate,
+                        levels = c("DAOM197198",
+                                   "CC4",
+                                   "Cuba8"))
+
+# add a function to calculate means and stdev
+data_std <- data %>%
+  group_by(AMFIsolate,Treatment,HarvestTime,ColonizationRegion) %>%
+  summarise(n=n(),mean=mean(ConcentrationPeruL),
+            sd=sd(ConcentrationPeruL)) %>%
+  mutate(se=sd/sqrt(n))
+
+# fix harvest time labels
+harvesttime<-c("2 months","4 months")
+names(harvesttime)<-c("2","4")
+
+# plot 2 month harvest time
+# subset
+HT2<-droplevels(subset(data_std,HarvestTime !="4"))
+# fix harvest time labels
+harvesttime<-c("2 months")
+names(harvesttime)<-c("2")
+# plot
+p1<- ggplot(HT2, aes(x=ColonizationRegion,y=mean,
+                          colour = Treatment,
+                          fill = Treatment,
+                          alpha = 0.5))+
+  geom_pointrange(aes(ymin=mean-sd,ymax=mean+sd),
+                  position = position_dodge2(width = 0.9))+
+  facet_grid(AMFIsolate~HarvestTime,
+             labeller = labeller(HarvestTime = harvesttime))+
+  theme_bw(base_size = 20)+theme(panel.grid = element_blank(),strip.background = 
+                                   element_blank())+
+  scale_color_manual(values = c("#004488","#DDAA33","#BB5566","#d55e00"))
+p1
+#rename axis labels
+p1<-p1+labs(x="Colonization Region",
+            y="Abundance (gene copies per uL sample DNA)")+
+  scale_y_continuous(breaks = c(0,100,200),limits = c(-50,200))
+p1
+
+# save
+ggsave(p1,filename = "Figure2.2_ddpcr_count_ht4.png", dpi = 300, width = 8, 
+       height = 6, units = "in")
+
+# plot 4 month harvest time
+# subset
+HT4<-droplevels(subset(data_std,HarvestTime !="2"))
+# fix harvest time labels
+harvesttime<-c("4 months post-inoculation")
+names(harvesttime)<-c("4")
+#plot
+p1<- ggplot(HT4, aes(x=ColonizationRegion,y=mean,
+                     colour = Treatment,
+                     fill = Treatment,
+                     alpha = 0.5))+
+  geom_pointrange(aes(ymin=mean-sd,ymax=mean+sd),
+                  position = position_dodge2(width = 0.9))+
+  facet_grid(AMFIsolate~HarvestTime,
+             labeller = labeller(HarvestTime = harvesttime))+
+  theme_bw(base_size = 20)+theme(panel.grid = element_blank(),strip.background = 
+                                   element_blank())+
+  scale_color_manual(values = c("#004488","#DDAA33","#BB5566","#d55e00"))
+p1
+# rename axis labels
+p1<-p1+labs(x="Colonization Region",
+            y="AMF inoculant abundance (gene copies per uL sample DNA)")+
+  scale_y_continuous(breaks = c(0,100,200),limits = c(-50,200))
+p1
+
+# save
+ggsave(p3,filename = "FigureA3_ddpcr_count_ht2.png", dpi = 300, width = 8, 
+       height = 6, units = "in")
+```
